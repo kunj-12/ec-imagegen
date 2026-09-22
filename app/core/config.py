@@ -1,6 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
-
+import json
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -54,6 +54,26 @@ class Settings(BaseSettings):
     MAX_IMAGES_PER_BATCH: int = 4
     IMAGE_SIZE: str = "1024x1024"
 
+        # --- Banner / marketing creatives (independent of restyle) ---
+    BANNER_ENABLED: bool = True
+    BANNER_PROVIDER: str = "fal"  # "fal" | "replicate"
+    BANNER_FAL_MODEL: str = "fal-ai/flux/schnell"
+    BANNER_REPLICATE_MODEL: str = "black-forest-labs/flux-schnell"
+    # Model-specific request args merged over the defaults, JSON dict.
+    BANNER_EXTRA_ARGS_JSON: str = "{}"
+    # Cost recorded per generated banner, in INR (business number, like RESTYLE_PRICE_*).
+    BANNER_PRICE_PER_IMAGE_INR: float = 1.0
+    BANNER_POLL_TIMEOUT_SECONDS: int = 120
+    BANNER_WIDTH: int = 1344
+    BANNER_HEIGHT: int = 512
+    BANNER_OUTPUT_FORMAT: str = "png"  # png | webp | jpg
+    BANNER_FONT_DIR: str = str(_PROJECT_ROOT / "app" / "assets" / "fonts")
+    BANNER_REMOVE_HERO_BG: bool = False  # needs `pip install rembg`
+    BANNER_QUEUE_NAME: str = "banner"
+    BANNER_JOB_TIMEOUT_SECONDS: int = 300
+    BANNER_MAX_ATTEMPTS_PER_BATCH: int = 5
+    BANNER_DAILY_LIMIT_PER_RESTAURANT: int = 20
+
     # --- Storage (local disk for now; swap for S3 client later) ---
     STORAGE_BACKEND: str = "local"
     LOCAL_STORAGE_DIR: str = str(_PROJECT_ROOT / "storage")
@@ -103,6 +123,21 @@ class Settings(BaseSettings):
             return self.REPLICATE_RESTYLE_MODEL
         return self.FAL_RESTYLE_MODEL
 
+    @property
+    def active_banner_model(self) -> str:
+        if self.BANNER_PROVIDER.strip().lower() == "replicate":
+            return self.BANNER_REPLICATE_MODEL
+        return self.BANNER_FAL_MODEL
+
+    @property
+    def banner_extra_args(self) -> dict:
+        try:
+            data = json.loads(self.BANNER_EXTRA_ARGS_JSON or "{}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"BANNER_EXTRA_ARGS_JSON is not valid JSON: {e}") from e
+        if not isinstance(data, dict):
+            raise ValueError("BANNER_EXTRA_ARGS_JSON must be a JSON object")
+        return data
 
 @lru_cache
 def get_settings() -> Settings:

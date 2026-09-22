@@ -3,7 +3,7 @@ import logging
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-
+from app.banner.router import router as banner_router
 from app.db.database import init_db, db
 from app.queue import redis_conn
 from app.routers import jobs
@@ -22,7 +22,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ec-imagegen", version="0.2.0", lifespan=lifespan)
 app.include_router(jobs.router)
-
+app.include_router(banner_router)
 
 @app.get("/health")
 def health():

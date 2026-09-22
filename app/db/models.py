@@ -1,8 +1,7 @@
 import enum
 import uuid
 from datetime import datetime, timezone
-
-from sqlalchemy import Boolean, DateTime, Enum, Float, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Enum, Float, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.database import Base
@@ -76,6 +75,41 @@ class ImageJob(Base):
     # avoid a migration — rename to cost_inr in a future cleanup pass along
     # with schemas.JobOut.cost_usd.
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+class BannerJob(Base):
+    """
+    One row per generated banner *attempt* (offer banners / marketing creatives).
+    Independent of ImageJob (menu-photo restyle). Attempts in a batch share
+    batch_id, offer_data and hero_source_path; variation_index is the attempt
+    number and drives theme cycling in app.banner.brief.
+    Reuses the existing `jobstatus` Postgres enum (pending/processing/completed/failed).
+    """
+    __tablename__ = "banner_jobs"
+    __table_args__ = (Index("ix_banner_jobs_restaurant_created", "restaurant_id", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[str] = mapped_column(String(36), default=_uuid, index=True)
+    restaurant_id: Mapped[str] = mapped_column(String(64))
+    creative_type: Mapped[str] = mapped_column(String(32), default="offer_banner")
+
+    status: Mapped[JobStatus] = mapped_column(Enum(JobStatus, name="jobstatus"), default=JobStatus.PENDING, index=True)
+    variation_index: Mapped[int] = mapped_column(Integer, default=0)
+
+    offer_data: Mapped[dict] = mapped_column(JSON)
+    hero_source_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    theme: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    model_used: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    is_selected: Mapped[bool] = mapped_column(Boolean, default=False)
+    background_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    image_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    cost_inr: Mapped[float | None] = mapped_column(Float, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

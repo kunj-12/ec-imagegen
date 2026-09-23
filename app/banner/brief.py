@@ -9,12 +9,36 @@ returns the same BannerBrief.
 
 The prompt deliberately asks for NO text/numbers: the model only paints
 artwork; all readable text is drawn by code afterwards.
+
+Dish-name handling (right_zone, no-hero path):
+  - Only ONE dish is described to the image model, never all of them joined.
+    Asking a text-to-image model to render 2-3 unrelated dishes convincingly
+    in a single photorealistic hero shot reliably produces worse, muddier
+    results than describing one dish well.
+  - Only Latin-script item names are sent to the model. Text-to-image models
+    do not reliably understand Devanagari/Gujarati/other non-Latin script as
+    food semantics — feeding them through produces unrelated or garbled
+    imagery (e.g. a Gujarati dish name has produced a plate of spaghetti in
+    testing). Non-Latin names fall back to a generic (but still appetizing,
+    still Indian-food-styled) subject instead of being passed through raw.
+  - No dish-specific descriptions are hardcoded anywhere in this file. What
+    a "momo" or a "dabeli" looks like is left entirely to the image model's
+    own training + the generic photography direction below (angle, lighting,
+    depth of field) — this file only ever forwards what the merchant typed,
+    it never invents visual details per dish. That keeps this maintainable
+    without a growing, always-incomplete dish dictionary.
 """
+import re
 from dataclasses import dataclass
 
 from app.banner.schemas import BannerOffer
 
 RGB = tuple[int, int, int]
+
+# ASCII letters/digits + common punctuation found in dish names ("Mac & Cheese",
+# "Paneer Tikka (Spicy)", "Cold-Brew"). Anything outside this range (Gujarati,
+# Devanagari, other scripts) is treated as unsafe to hand to the image model.
+_LATIN_SAFE_RE = re.compile(r"^[\x00-\x7F\s.,'&()/\-]*$")
 
 
 @dataclass(frozen=True)
@@ -67,6 +91,35 @@ def pick_theme(style: str | None, variation_index: int) -> Theme:
     return THEMES[variation_index % len(THEMES)]
 
 
+def _is_model_safe_text(text: str) -> bool:
+    """
+    True if `text` is plain Latin script (ASCII letters/digits/basic
+    punctuation) and therefore safe to hand to an English-prompted
+    text-to-image model as a food subject description.
+
+    Uses the same idea as compositor.font_file_for() (Unicode range
+    detection), but for a different purpose: font_file_for() picks which
+    font can *render* a string; this decides whether the image model can
+    plausibly *understand* it as a food name. A dish name can be perfectly
+    renderable by a Devanagari font and still be meaningless to the model.
+    """
+    text = text.strip()
+    return bool(text) and bool(_LATIN_SAFE_RE.match(text))
+
+
+def _primary_dish_subject(offer: BannerOffer) -> str | None:
+    """
+    Pick the first model-safe (Latin-script) item name to use as the AI
+    hero-shot subject. Returns None if there are no items, or none of the
+    item names are safe to send to the model (e.g. all Gujarati/Hindi) —
+    callers should fall back to a generic subject in that case.
+    """
+    for item in offer.items:
+        if _is_model_safe_text(item.name):
+            return item.name.strip()
+    return None
+
+
 def build_brief(
     offer: BannerOffer,
     *,
@@ -79,14 +132,22 @@ def build_brief(
 
     if has_hero:
         right_zone = (
-            "a clean, softly lit open area with gentle depth where a product photo "
-            "will be placed later; keep it free of any food, plates or objects"
+            "a clean, softly lit open area with warm natural directional light "
+            "and a subtle soft shadow gradient on the surface, gentle depth, "
+            "where a product photo will be placed later; keep it free of any "
+            "food, plates, or objects"
         )
     else:
-        dishes = ", ".join(i.name for i in offer.items) or "a signature dish"
+        dish_name = _primary_dish_subject(offer)
+        subject = f"a plate of {dish_name}" if dish_name else "an appetizing, well-plated Indian dish"
+
         right_zone = (
-            f"a beautiful, appetizing, photorealistic hero shot of {dishes}, "
-            "professionally styled for commercial food advertising"
+            f"a professional food-photography hero shot of {subject}, "
+            "photographed from a slight top-down three-quarter angle, "
+            "soft natural side lighting, shallow depth of field with a gently "
+            "blurred background, rich natural colours and visible texture, "
+            "a wisp of steam or fresh garnish for appetite appeal, "
+            "on a clean minimal surface, styled like a premium food delivery app photo"
         )
 
     prompt = (

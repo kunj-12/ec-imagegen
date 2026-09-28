@@ -34,3 +34,4 @@ dump.rdb
 
 scripts/
 banner_benchmark_out/
+addon_test_output/

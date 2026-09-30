@@ -9,6 +9,7 @@ from app.core.config import get_settings
 from app.db.database import get_db
 from app.db.models import ImageJob
 from app.schemas import (
+    BatchStylesOut,
     GenerateRestyleRequest,
     JobOut,
     RegenerateRestyleRequest,
@@ -139,23 +140,37 @@ def generate_restyle(req: GenerateRestyleRequest, db: Session = Depends(get_db))
         raise HTTPException(status_code=422, detail=str(e))
     except job_service.RestyleStyleAlreadyChosen as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except job_service.RestyleQueueUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @router.post("/restyle/regenerate", response_model=JobOut, status_code=201)
 def regenerate_restyle(req: RegenerateRestyleRequest, db: Session = Depends(get_db)):
     """
     Merchant didn't like the current image — regenerate against the same
-    source photo. Blocked with 409 if a generation for this batch is
-    already in flight, or if MAX_IMAGES_PER_BATCH has been reached.
+    source photo with the style they pick from GET /jobs/batch/{batch_id}/styles.
+    style_index is optional: omit it and the server auto-picks the next
+    unused style (or a model-chosen surface once all are used).
+
+    404 unknown batch, 422 style_index out of range, 409 if a generation is
+    already in flight / no style chosen yet / MAX_IMAGES_PER_BATCH reached /
+    the style was already used, 503 if the queue is unavailable.
     """
     try:
-        return job_service.regenerate_restyle(db, req.batch_id)
+        return job_service.regenerate_restyle(db, req.batch_id, req.style_index)
     except job_service.RestyleBatchNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
-    except (job_service.RestyleGenerationInProgress, job_service.RestyleStyleNotChosen) as e:
+    except job_service.InvalidRestyleStyle as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except (
+        job_service.RestyleGenerationInProgress,
+        job_service.RestyleStyleNotChosen,
+        job_service.RestyleLimitReached,
+        job_service.RestyleStyleAlreadyUsed,
+    ) as e:
         raise HTTPException(status_code=409, detail=str(e))
-    except job_service.RestyleLimitReached as e:
-        raise HTTPException(status_code=409, detail=str(e))
+    except job_service.RestyleQueueUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @router.post("/restyle/select", response_model=JobOut, status_code=201)
@@ -179,6 +194,19 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@router.get("/batch/{batch_id}/styles", response_model=BatchStylesOut)
+def get_batch_styles(batch_id: str, db: Session = Depends(get_db)):
+    """
+    Styles the merchant can still pick for the NEXT regenerate (unused ones
+    only: 8 at the start, then 7, 6, ...), plus can_regenerate / blocked_reason
+    so the frontend knows whether to show the picker at all.
+    """
+    try:
+        return job_service.get_available_styles(db, batch_id)
+    except job_service.RestyleBatchNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/batch/{batch_id}", response_model=list[JobOut])

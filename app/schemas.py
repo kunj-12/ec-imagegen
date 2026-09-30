@@ -39,6 +39,26 @@ class GenerateRestyleRequest(BaseModel):
 
 class RegenerateRestyleRequest(BaseModel):
     batch_id: str
+    # Style the merchant picked for this regenerate (must be one that is still
+    # available — see GET /jobs/batch/{batch_id}/styles). Omit / null to keep
+    # the old behaviour: the server auto-picks the next unused style, or lets
+    # the model choose freely once every curated style has been used.
+    style_index: int | None = None
+
+
+class BatchStylesOut(BaseModel):
+    batch_id: str
+    # Curated styles NOT yet used in this batch — the options to show.
+    styles: list[StyleOut]
+    attempts_used: int
+    max_attempts: int
+    can_regenerate: bool
+    # None when can_regenerate is True; otherwise one of:
+    # "style_not_chosen" | "generation_in_progress" | "limit_reached"
+    blocked_reason: str | None = None
+    # True when every curated style is used but regenerate is still allowed:
+    # call regenerate WITHOUT style_index and the model picks the surface.
+    free_choice_available: bool = False
 
 
 class SelectRestyleRequest(BaseModel):

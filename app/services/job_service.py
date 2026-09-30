@@ -1,5 +1,6 @@
 import logging
 import uuid
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -7,7 +8,7 @@ from app.core.config import get_settings
 from app.db.models import ImageJob, JobStatus
 from app.queue import image_queue, redis_conn
 from app.services.storage import get_storage
-from app.services.prompt_builder import RESTYLE_VARIATION_STYLES
+from app.services.prompt_builder import RESTYLE_VARIATION_STYLES, get_style_options
 from app.worker import process_image_job
 
 # Redis key backing the atomic counter that hands out batch_number values
@@ -78,6 +79,19 @@ class InvalidRestyleStyle(Exception):
     pass
 
 
+class RestyleStyleAlreadyUsed(Exception):
+    """
+    The requested style already has a completed or in-flight attempt in this
+    batch. Regenerate only offers styles that have not been used yet.
+    """
+    pass
+
+
+class RestyleQueueUnavailable(Exception):
+    """The job row was saved but could not be pushed onto the queue (e.g. Redis down)."""
+    pass
+
+
 def create_restyle_batch(
     db: Session,
     *,
@@ -144,21 +158,80 @@ def start_restyle(db: Session, batch_id: str, style_index: int) -> ImageJob:
     db.commit()
     db.refresh(job)
 
-    image_queue.enqueue(
-        process_image_job, job.id, job_timeout=settings.RESTYLE_JOB_TIMEOUT_SECONDS
-    )
+    _enqueue_or_fail(db, job, revert_to_awaiting=True)
     return job
+
+
+# A PENDING/PROCESSING row older than the RQ job timeout (+ this grace) cannot
+# still be alive — its worker was killed or crashed before it could record a
+# failure. Such rows are treated as failed so they never block the batch
+# forever ("generation already in progress").
+_STALE_JOB_GRACE_SECONDS = 60
+
+
+def _is_stale(job: ImageJob) -> bool:
+    if job.status not in (JobStatus.PENDING, JobStatus.PROCESSING):
+        return False
+    ts = job.updated_at
+    if ts is None:
+        return False
+    if ts.tzinfo is None:  # SQLite returns naive datetimes
+        ts = ts.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - ts).total_seconds()
+    return age > settings.RESTYLE_JOB_TIMEOUT_SECONDS + _STALE_JOB_GRACE_SECONDS
+
+
+def _is_active(job: ImageJob) -> bool:
+    """A generation that is genuinely still running or queued."""
+    return job.status in (JobStatus.PENDING, JobStatus.PROCESSING) and not _is_stale(job)
+
+
+def _consumed_styles(jobs: list[ImageJob]) -> set[int]:
+    """
+    Styles that are used up in this batch: completed, or currently running.
+    A style whose attempt FAILED produced no image, so the merchant may pick
+    it again (failed rows still count towards MAX_IMAGES_PER_BATCH).
+    """
+    return {
+        job.style_index
+        for job in jobs
+        if job.style_index is not None and (job.status == JobStatus.COMPLETED or _is_active(job))
+    }
+
+
+def _enqueue_or_fail(db: Session, job: ImageJob, *, revert_to_awaiting: bool = False) -> None:
+    """
+    Pushes the job onto the queue. If that fails (Redis down, etc.) the row
+    would otherwise sit at PENDING forever and block the batch, so it is
+    resolved here: reverted to AWAITING_STYLE (first generation, so the
+    merchant can simply pick again) or marked FAILED (regenerate).
+    """
+    try:
+        image_queue.enqueue(
+            process_image_job, job.id, job_timeout=settings.RESTYLE_JOB_TIMEOUT_SECONDS
+        )
+    except Exception:
+        logger.exception("Failed to enqueue restyle job %s", job.id)
+        if revert_to_awaiting:
+            job.status = JobStatus.AWAITING_STYLE
+            job.style_index = None
+        else:
+            job.status = JobStatus.FAILED
+            job.error_message = "Could not queue the generation job. Please try again."
+        db.commit()
+        raise RestyleQueueUnavailable("Generation service is temporarily unavailable. Please try again.")
 
 
 def _next_unused_style(existing: list[ImageJob]) -> int | None:
     """
+    Used only when regenerate is called WITHOUT a style_index (auto mode).
     Continues after the merchant's first pick and wraps around, skipping
-    styles already used in this batch. E.g. first pick 2 of 7 -> 3,4,5,6,0,1.
+    styles already used in this batch. E.g. first pick 2 of 8 -> 3,4,5,6,7,0,1.
     Returns None when every style has been used (caller then lets the model
     choose the surface freely).
     """
     total = len(RESTYLE_VARIATION_STYLES)
-    used = {job.style_index for job in existing if job.style_index is not None}
+    used = _consumed_styles(existing)
     first = existing[0].style_index or 0
     for step in range(1, total + 1):
         candidate = (first + step) % total
@@ -167,18 +240,21 @@ def _next_unused_style(existing: list[ImageJob]) -> int | None:
     return None
 
 
-def regenerate_restyle(db: Session, batch_id: str) -> ImageJob:
-    """
-    Merchant didn't like the current image and clicked "Regenerate": run
-    the SAME source photo through the provider again with the next unused
-    style (or, once all styles are used, a model-chosen surface), as a new row in the same batch.
+def _blocked_reason(existing: list[ImageJob]) -> str | None:
+    if any(job.status == JobStatus.AWAITING_STYLE for job in existing):
+        return "style_not_chosen"
+    if any(_is_active(job) for job in existing):
+        return "generation_in_progress"
+    if len(existing) >= settings.MAX_IMAGES_PER_BATCH:
+        return "limit_reached"
+    return None
 
-    Guards (all enforced here, server-side — never trust the frontend
-    button being disabled):
-      - RestyleStyleNotChosen: the merchant hasn't picked a first style yet.
-      - RestyleGenerationInProgress: another attempt in this batch is still
-        PENDING/PROCESSING.
-      - RestyleLimitReached: MAX_IMAGES_PER_BATCH rows exist.
+
+def get_available_styles(db: Session, batch_id: str) -> dict:
+    """
+    What the frontend shows after each generation: the curated styles this
+    batch has NOT used yet (8 at first, then 7, 6, ...), plus whether
+    regenerate is currently allowed and why not if blocked.
     """
     existing = (
         db.query(ImageJob)
@@ -189,24 +265,96 @@ def regenerate_restyle(db: Session, batch_id: str) -> ImageJob:
     if not existing:
         raise RestyleBatchNotFound(f"No batch with id {batch_id}")
 
-    if any(job.status == JobStatus.AWAITING_STYLE for job in existing):
-        raise RestyleStyleNotChosen(f"Batch {batch_id} has no style selected yet")
+    consumed = _consumed_styles(existing)
+    styles = [opt for opt in get_style_options() if opt["index"] not in consumed]
+    reason = _blocked_reason(existing)
 
-    if any(job.status in (JobStatus.PENDING, JobStatus.PROCESSING) for job in existing):
+    return {
+        "batch_id": batch_id,
+        "styles": styles,
+        "attempts_used": sum(1 for job in existing if job.status != JobStatus.AWAITING_STYLE),
+        "max_attempts": settings.MAX_IMAGES_PER_BATCH,
+        "can_regenerate": reason is None,
+        "blocked_reason": reason,
+        "free_choice_available": reason is None and not styles,
+    }
+
+
+def regenerate_restyle(db: Session, batch_id: str, style_index: int | None = None) -> ImageJob:
+    """
+    Merchant didn't like the current image and clicked "Regenerate": run
+    the SAME source photo through the provider again as a new row in the
+    same batch.
+
+    style_index given  -> that exact style (must still be unused).
+    style_index None   -> auto: next unused style, or a model-chosen surface
+                          once every curated style has been used.
+
+    Guards (all enforced here, server-side — never trust the frontend
+    button being disabled):
+      - InvalidRestyleStyle: style_index out of range.
+      - RestyleStyleNotChosen: the merchant hasn't picked a first style yet.
+      - RestyleGenerationInProgress: another attempt in this batch is still
+        PENDING/PROCESSING.
+      - RestyleLimitReached: MAX_IMAGES_PER_BATCH rows exist.
+      - RestyleStyleAlreadyUsed: the requested style was already used.
+
+    Concurrency: the batch's first row is locked (SELECT ... FOR UPDATE) and
+    the batch is re-read AFTER the lock is granted, so two simultaneous
+    requests (double-click, two tabs) are serialized — the second one sees
+    the first one's PENDING row and gets RestyleGenerationInProgress.
+    """
+    if style_index is not None and not 0 <= style_index < len(RESTYLE_VARIATION_STYLES):
+        raise InvalidRestyleStyle(
+            f"style_index must be between 0 and {len(RESTYLE_VARIATION_STYLES) - 1}"
+        )
+
+    anchor = (
+        db.query(ImageJob)
+        .filter(ImageJob.batch_id == batch_id)
+        .order_by(ImageJob.variation_index)
+        .with_for_update()
+        .first()
+    )
+    if anchor is None:
+        raise RestyleBatchNotFound(f"No batch with id {batch_id}")
+
+    # Separate statement => fresh snapshot taken after the lock was granted.
+    existing = (
+        db.query(ImageJob)
+        .filter(ImageJob.batch_id == batch_id)
+        .order_by(ImageJob.variation_index)
+        .populate_existing()
+        .all()
+    )
+
+    for job in existing:
+        if _is_stale(job):
+            logger.warning("Marking stale restyle job %s as failed", job.id)
+            job.status = JobStatus.FAILED
+            job.error_message = "Generation timed out."
+
+    reason = _blocked_reason(existing)
+    if reason == "style_not_chosen":
+        raise RestyleStyleNotChosen(f"Batch {batch_id} has no style selected yet")
+    if reason == "generation_in_progress":
         raise RestyleGenerationInProgress(
             f"Batch {batch_id} already has a generation in progress"
         )
-
-    if len(existing) >= settings.MAX_IMAGES_PER_BATCH:
+    if reason == "limit_reached":
         raise RestyleLimitReached(
             f"Batch {batch_id} has reached the maximum of "
             f"{settings.MAX_IMAGES_PER_BATCH} images"
         )
 
-    # All curated styles used -> None -> the model freely picks the surface
-    # (same behavior as the original first-generation prompt). Only
-    # MAX_IMAGES_PER_BATCH stops the batch from here on.
-    next_style = _next_unused_style(existing)
+    if style_index is None:
+        chosen_style = _next_unused_style(existing)
+    else:
+        if style_index in _consumed_styles(existing):
+            raise RestyleStyleAlreadyUsed(
+                f"Style {style_index} was already used in batch {batch_id}"
+            )
+        chosen_style = style_index
 
     template = existing[0]  # source photo + extra_styling are identical across a batch
 
@@ -214,8 +362,8 @@ def regenerate_restyle(db: Session, batch_id: str) -> ImageJob:
         batch_id=batch_id,
         batch_number=template.batch_number,  # same folder as the rest of this batch
         status=JobStatus.PENDING,
-        variation_index=len(existing),
-        style_index=next_style,
+        variation_index=max(j.variation_index for j in existing) + 1,
+        style_index=chosen_style,
         extra_styling=template.extra_styling,
         source_image_path=template.source_image_path,
     )
@@ -223,10 +371,7 @@ def regenerate_restyle(db: Session, batch_id: str) -> ImageJob:
     db.commit()
     db.refresh(job)
 
-    image_queue.enqueue(
-        process_image_job, job.id, job_timeout=settings.RESTYLE_JOB_TIMEOUT_SECONDS
-    )
-
+    _enqueue_or_fail(db, job)
     return job
 
 
